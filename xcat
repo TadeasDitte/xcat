@@ -1,0 +1,109 @@
+#!/bin/sh
+set -eu
+
+prog=${0##*/}
+tmp=
+trap '[ -n "$tmp" ] && rm -f "$tmp"' EXIT
+trap 'exit 130' INT TERM
+
+usage() {
+	cat <<EOF
+Usage: $prog [-h] [FILE...]
+
+Print FILE(s) to stdout, decompressing / extracting as needed.
+With no FILE, or when FILE is -, read standard input.
+
+Supported: plain text, gzip, bzip2, xz, zstd, tar, tar.gz, tar.bz2,
+tar.xz, tar.zst, zip. Unknown types are passed through like cat.
+EOF
+}
+
+err() { printf '%s: %s\n' "$prog" "$*" >&2; }
+
+need() {
+	command -v "$1" >/dev/null 2>&1 && return 0
+	err "$name: $2 data needs '$1', which is not installed"
+	return 1
+}
+
+hexhead() { head -c 512 | od -v -An -tx1 | tr -d ' \n'; }
+
+is_tar() {
+	[ "${#1}" -ge 524 ] || return 1
+	[ "$(printf '%s' "$1" | cut -c515-524)" = 7573746172 ]
+}
+
+cat_zip() {
+	if command -v unzip >/dev/null 2>&1; then
+		unzip -p -- "$1"
+	elif command -v bsdtar >/dev/null 2>&1; then
+		bsdtar -xOf "$1"
+	elif command -v python3 >/dev/null 2>&1; then
+		python3 -c '
+import shutil, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    for info in z.infolist():
+        if not info.is_dir():
+            with z.open(info) as m:
+                shutil.copyfileobj(m, sys.stdout.buffer)
+' "$1"
+	else
+		err "$name: zip data needs 'unzip', 'bsdtar' or 'python3'"
+		return 1
+	fi
+}
+
+cat_compressed() {
+	need "$2" "$4" || return 1
+	if is_tar "$("$2" <"$1" 2>/dev/null | hexhead)"; then
+		need tar "$4-compressed tar" || return 1
+		tar "$3" -xOf "$1"
+	else
+		"$2" <"$1"
+	fi
+}
+
+xcat_file() {
+	hex=$(hexhead <"$1")
+	case $hex in
+	1f8b*) cat_compressed "$1" zcat -z gzip ;;
+	425a68*) cat_compressed "$1" bzcat -j bzip2 ;;
+	fd377a585a00*) cat_compressed "$1" xzcat -J xz ;;
+	28b52ffd*) cat_compressed "$1" zstdcat --zstd zstd ;;
+	504b0304* | 504b0506*) cat_zip "$1" ;;
+	*)
+		if is_tar "$hex"; then
+			need tar tar || return 1
+			tar -xOf "$1"
+		else
+			cat -- "$1"
+		fi
+		;;
+	esac
+}
+
+case ${1-} in
+-h | --help) usage; exit 0 ;;
+--) shift ;;
+esac
+[ $# -gt 0 ] || set -- -
+
+status=0
+for arg; do
+	name=$arg
+	if [ "$arg" = - ]; then
+		name='(stdin)'
+		[ -n "$tmp" ] || tmp=$(mktemp "${TMPDIR:-/tmp}/xcat.XXXXXX")
+		cat >"$tmp"
+		file=$tmp
+	else
+		file=$arg
+		if [ -d "$file" ]; then
+			err "$name: is a directory"; status=1; continue
+		elif [ ! -r "$file" ]; then
+			err "$name: cannot read file"; status=1; continue
+		fi
+	fi
+	xcat_file "$file" || status=1
+done
+exit "$status"
